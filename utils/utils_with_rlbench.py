@@ -1,6 +1,9 @@
 import os
 import glob
 import random
+import subprocess
+from datetime import datetime
+from urllib.request import urlopen
 from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import json
@@ -80,6 +83,105 @@ ARM2Joint = {
 Joint2ARM = {v: [] for k, v in ARM2Joint.items()}
 for k, v in ARM2Joint.items():
     Joint2ARM[v].append(k)
+
+def _ensure_git_safe_directories(repo_dirs: List[Path]) -> None:
+    for repo_dir in repo_dirs:
+        path = str(repo_dir.resolve())
+        subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", "*"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _git_cmd(repo_dir: Path, *args: str) -> List[str]:
+    return ["git", "-c", "safe.directory=*", "-C", str(repo_dir.resolve()), *args]
+
+
+def _collect_git_status(repo_dir: Path, label: str) -> str:
+    try:
+        branch = subprocess.check_output(
+            _git_cmd(repo_dir, "rev-parse", "--abbrev-ref", "HEAD"),
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+        commit = subprocess.check_output(
+            _git_cmd(repo_dir, "log", "-1", "--pretty=format:%H %s"),
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+        diff = subprocess.check_output(
+            _git_cmd(repo_dir, "diff", "HEAD"),
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode().strip() if isinstance(e.stderr, bytes) else (e.stderr or "").strip()
+        raise RuntimeError(
+            f"Failed to get git status for {label} at {repo_dir}: {stderr or e}"
+        ) from e
+
+    lines = [
+        f"=== {label} ===",
+        f"Repo: {repo_dir}",
+        f"Branch: {branch}",
+        f"Commit: {commit}",
+        "Diff against HEAD:",
+        diff if diff else "No changes",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _get_public_ip() -> str:
+    ip_services = [
+        "https://api.ipify.org",
+        "https://checkip.amazonaws.com",
+        "https://ipv4.icanhazip.com",
+    ]
+    errors = []
+    for url in ip_services:
+        try:
+            with urlopen(url, timeout=10) as response:
+                ip = response.read().decode("utf-8").strip()
+            if ip:
+                return ip
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+    raise RuntimeError(
+        "Failed to get public IP address: " + "; ".join(errors)
+    )
+
+
+def log_environment_status(task_name: str, vis_save_dir: str):
+    if not vis_save_dir:
+        return
+
+    dfa_dir = Path(__file__).resolve().parents[1]
+    repo_specs = [
+        ("3dfa", dfa_dir),
+        ("rlbench", dfa_dir.parent / "RLBench"),
+        ("pyrep", dfa_dir.parent / "PyRep"),
+    ]
+    _ensure_git_safe_directories([repo_dir for _, repo_dir in repo_specs])
+
+    log_sections = []
+    for label, repo_dir in repo_specs:
+        log_sections.append(_collect_git_status(repo_dir, label))
+
+    public_ip = _get_public_ip()
+    log_sections.append(f"=== Server IP ===\n{public_ip}\n")
+
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = Path(vis_save_dir) / task_name / f"git_{time_stamp}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("\n".join(log_sections))
+    return
 
 def get_mask_with_obj_indices_ts(
         obj: torch.Tensor,
@@ -1743,6 +1845,8 @@ class RLBenchEnv:
         bool_world_server: bool = False,
         world_server_port: int = 8766,
     ):
+        # log environment status
+        log_environment_status(task_str, vis_save_dir)
         self.env.launch()
 
         camera_resolution = self.image_size

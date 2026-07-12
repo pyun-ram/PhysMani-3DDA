@@ -86,6 +86,10 @@ class BaseTrainTester:
         g = torch.Generator()
         g.manual_seed(0)
         train_sampler = DistributedSampler(train_dataset)
+        use_pin_memory = torch.cuda.is_available()
+        pin_memory_device = (
+            f"cuda:{self.args.local_rank}" if use_pin_memory else ""
+        )
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.args.batch_size,
@@ -93,7 +97,8 @@ class BaseTrainTester:
             num_workers=self.args.num_workers,
             worker_init_fn=h5_worker_init_fn,
             collate_fn=collate_fn,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
+            pin_memory_device=pin_memory_device,
             sampler=train_sampler,
             drop_last=True,
             generator=g
@@ -106,7 +111,8 @@ class BaseTrainTester:
             num_workers=1,
             worker_init_fn=h5_worker_init_fn,
             collate_fn=collate_fn,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
+            pin_memory_device=pin_memory_device,
             sampler=test_sampler,
             drop_last=False,
             generator=g
