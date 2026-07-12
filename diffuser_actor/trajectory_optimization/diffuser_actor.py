@@ -37,6 +37,8 @@ class DiffuserActor(nn.Module):
                  rotation_parametrization='6D',
                  quaternion_format='xyzw',
                  diffusion_timesteps=100,
+                 denoise_model="ddpm",
+                 num_inference_steps=100,
                  nhist=3,
                  relative=False,
                  lang_enhanced=False):
@@ -61,59 +63,93 @@ class DiffuserActor(nn.Module):
             nhist=nhist,
             lang_enhanced=lang_enhanced
         )
-        self.position_noise_scheduler = DDPMScheduler(
-            num_train_timesteps=diffusion_timesteps,
-            beta_schedule="scaled_linear",
-            prediction_type="epsilon"
-        )
-        self.rotation_noise_scheduler = DDPMScheduler(
-            num_train_timesteps=diffusion_timesteps,
-            beta_schedule="squaredcos_cap_v2",
-            prediction_type="epsilon"
-        )
+        # 根据 denoise_model 选择 scheduler
+        if denoise_model == "ddpm":
+            self.position_noise_scheduler = DDPMScheduler(
+                num_train_timesteps=diffusion_timesteps,
+                beta_schedule="scaled_linear",
+                prediction_type="epsilon"
+            )
+            self.rotation_noise_scheduler = DDPMScheduler(
+                num_train_timesteps=diffusion_timesteps,
+                beta_schedule="squaredcos_cap_v2",
+                prediction_type="epsilon"
+            )
+        elif denoise_model == "rectified_flow":
+            from diffuser_actor.utils.rectified_flow import RFScheduler
+            self.position_noise_scheduler = RFScheduler(
+                noise_sampler="logit_normal",
+                noise_sampler_config={"mean": 0, "std": 1.5}
+            )
+            self.rotation_noise_scheduler = RFScheduler(
+                noise_sampler="logit_normal",
+                noise_sampler_config={"mean": 0, "std": 1.5}
+            )
+        else:
+            raise NotImplementedError(f"denoise_model {denoise_model} not supported")
         self.n_steps = diffusion_timesteps
+        self.num_inference_steps = num_inference_steps
+        self.denoise_model = denoise_model
         self.gripper_loc_bounds = torch.tensor(gripper_loc_bounds)
 
-    def encode_inputs(self, visible_rgb, visible_pcd, instruction,
+    def encode_inputs(self, visible_rgb, visible_pcd, visible_mask, instruction,
                       curr_gripper):
         # Compute visual features/positional embeddings at different scales
-        rgb_feats_pyramid, pcd_pyramid = self.encoder.encode_images(
-            visible_rgb, visible_pcd
+        rgb_feats_pyramid, pcd_pyramid, mask_pyramid = self.encoder.encode_images(
+            visible_rgb, visible_pcd, mask=visible_mask,
         )
+        # visible_rgb: [36, 1, 3, 256, 256]
+        # visible_pcd: [36, 1, 3, 256, 256]
+        # rgb_feats_pyramid: [[32, 1, 120, 32, 32],]
+        # pcd_pyramid: [[32,1x32x32, 3],]
+        # mask_pyramid: [[32, 1x32x32],]
+
         # Keep only low-res scale
         context_feats = einops.rearrange(
             rgb_feats_pyramid[0],
             "b ncam c h w -> b (ncam h w) c"
         )
         context = pcd_pyramid[0]
+        context_mask = mask_pyramid[0]
+        ## context_feats: [32, 1x32x32, 120]
+        ## context: [32, 1x32x32, 3]
+        ## context_mask: [32, 1x32x32]
 
         # Encode instruction (B, 53, F)
         instr_feats = None
         if self.use_instruction:
             instr_feats, _ = self.encoder.encode_instruction(instruction)
-
+        ## instruction [32, 53, 512]
+        ## instr_feats [32, 53, 120]
         # Cross-attention vision to language
         if self.use_instruction:
             # Attention from vision to language
             context_feats = self.encoder.vision_language_attention(
                 context_feats, instr_feats
             )
-
+            ## context_feats: 32, 1024, 120
         # Encode gripper history (B, nhist, F)
         adaln_gripper_feats, _ = self.encoder.encode_curr_gripper(
             curr_gripper, context_feats, context
         )
+        ## curr_gripper: 32x 3x 9
+        ## adaln_gripper_feats: 32 x 3 x 120
 
         # FPS on visual features (N, B, F) and (B, N, F, 2)
-        fps_feats, fps_pos = self.encoder.run_fps(
+        fps_feats, fps_pos, fps_pos_xyz = self.encoder.run_fps(
             context_feats.transpose(0, 1),
-            self.encoder.relative_pe_layer(context)
+            self.encoder.relative_pe_layer(context),
+            context,
+            context_mask=context_mask,
         )
+        ## fps_feats: 204, 32, 120
+        ## fps_pos: 32, 204, 120, 2
+        ## fps_pos_xyz: 32, 204, 3
         return (
             context_feats, context,  # contextualized visual features
             instr_feats,  # language features
             adaln_gripper_feats,  # gripper history features
-            fps_feats, fps_pos  # sampled visual features
+            fps_feats, fps_pos, fps_pos_xyz # sampled visual features
         )
 
     def policy_forward_pass(self, trajectory, timestep, fixed_inputs):
@@ -139,8 +175,14 @@ class DiffuserActor(nn.Module):
         )
 
     def conditional_sample(self, condition_data, condition_mask, fixed_inputs):
-        self.position_noise_scheduler.set_timesteps(self.n_steps)
-        self.rotation_noise_scheduler.set_timesteps(self.n_steps)
+        # 根据模型类型设置 timesteps
+        if self.denoise_model == "ddpm":
+            self.position_noise_scheduler.set_timesteps(self.n_steps)
+            self.rotation_noise_scheduler.set_timesteps(self.n_steps)
+        elif self.denoise_model == "rectified_flow":
+            device = condition_data.device
+            self.position_noise_scheduler.set_timesteps(self.num_inference_steps, device=device)
+            self.rotation_noise_scheduler.set_timesteps(self.num_inference_steps, device=device)
 
         # Random trajectory, conditioned on start-end
         noise = torch.randn(
@@ -149,9 +191,15 @@ class DiffuserActor(nn.Module):
             device=condition_data.device
         )
         # Noisy condition data
-        noise_t = torch.ones(
-            (len(condition_data),), device=condition_data.device
-        ).long().mul(self.position_noise_scheduler.timesteps[0])
+        if self.denoise_model == "ddpm":
+            noise_t = torch.ones(
+                (len(condition_data),), device=condition_data.device
+            ).long().mul(self.position_noise_scheduler.timesteps[0])
+        elif self.denoise_model == "rectified_flow":
+            # RF uses float timesteps, start from 1.0
+            noise_t = torch.ones(
+                (len(condition_data),), device=condition_data.device
+            ).float() * 1.0
         noise_pos = self.position_noise_scheduler.add_noise(
             condition_data[..., :3], noise[..., :3], noise_t
         )
@@ -165,19 +213,36 @@ class DiffuserActor(nn.Module):
 
         # Iterative denoising
         timesteps = self.position_noise_scheduler.timesteps
-        for t in timesteps:
+        for t_ind, t in enumerate(timesteps):
+            # 对于 policy_forward_pass，DDPM 需要 long [0, n_steps-1]，RF 需要 float [0, 1]
+            if self.denoise_model == "ddpm":
+                timestep_for_forward = t * torch.ones(len(trajectory)).to(trajectory.device).long()
+            elif self.denoise_model == "rectified_flow":
+                # RF 的 t 是 float [1.0, 0.0]，直接使用（与训练时一致）
+                # DenoiseActor 中也是直接使用 t，虽然代码中有 .long()，但由于类型提升，实际传给 time_emb 的仍是 float
+                timestep_for_forward = t * torch.ones(len(trajectory)).to(trajectory.device)
+            
             out = self.policy_forward_pass(
                 trajectory,
-                t * torch.ones(len(trajectory)).to(trajectory.device).long(),
+                timestep_for_forward,
                 fixed_inputs
             )
             out = out[-1]  # keep only last layer's output
-            pos = self.position_noise_scheduler.step(
-                out[..., :3], t, trajectory[..., :3]
-            ).prev_sample
-            rot = self.rotation_noise_scheduler.step(
-                out[..., 3:9], t, trajectory[..., 3:9]
-            ).prev_sample
+            # step 方法：DDPM 使用 t（timestep 值），RF 使用 t_ind（索引）
+            if self.denoise_model == "ddpm":
+                pos = self.position_noise_scheduler.step(
+                    out[..., :3], t, trajectory[..., :3]
+                ).prev_sample
+                rot = self.rotation_noise_scheduler.step(
+                    out[..., 3:9], t, trajectory[..., 3:9]
+                ).prev_sample
+            elif self.denoise_model == "rectified_flow":
+                pos = self.position_noise_scheduler.step(
+                    out[..., :3], t_ind, trajectory[..., :3]
+                ).prev_sample
+                rot = self.rotation_noise_scheduler.step(
+                    out[..., 3:9], t_ind, trajectory[..., 3:9]
+                ).prev_sample
             trajectory = torch.cat((pos, rot), -1)
 
         trajectory = torch.cat((trajectory, out[..., 9:]), -1)
@@ -203,9 +268,9 @@ class DiffuserActor(nn.Module):
 
         # Prepare inputs
         fixed_inputs = self.encode_inputs(
-            rgb_obs, pcd_obs, instruction, curr_gripper
+            rgb_obs, pcd_obs, visible_mask=None, instruction=instruction, curr_gripper=curr_gripper
         )
-
+        fixed_inputs = fixed_inputs[:-1]
         # Condition on start-end pose
         B, nhist, D = curr_gripper.shape
         cond_data = torch.zeros(
@@ -232,8 +297,11 @@ class DiffuserActor(nn.Module):
         # Convert gripper status to probaility
         if trajectory.shape[-1] > 7:
             trajectory[..., 7] = trajectory[..., 7].sigmoid()
-
-        return trajectory
+        output_dict = {
+            "action": trajectory,
+            "attention": {},
+        }
+        return output_dict
 
     def normalize_pos(self, pos):
         pos_min = self.gripper_loc_bounds[0].float().to(pos.device)
@@ -303,7 +371,8 @@ class DiffuserActor(nn.Module):
         pcd_obs,
         instruction,
         curr_gripper,
-        run_inference=False
+        run_inference=False,
+        **kwargs
     ):
         """
         Arguments:
@@ -352,8 +421,9 @@ class DiffuserActor(nn.Module):
 
         # Prepare inputs
         fixed_inputs = self.encode_inputs(
-            rgb_obs, pcd_obs, instruction, curr_gripper
+            rgb_obs, pcd_obs, visible_mask=None, instruction=instruction, curr_gripper=curr_gripper
         )
+        fixed_inputs = fixed_inputs[:-1]
 
         # Condition on start-end pose
         cond_data = torch.zeros_like(gt_trajectory)
@@ -364,11 +434,16 @@ class DiffuserActor(nn.Module):
         noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
 
         # Sample a random timestep
-        timesteps = torch.randint(
-            0,
-            self.position_noise_scheduler.config.num_train_timesteps,
-            (len(noise),), device=noise.device
-        ).long()
+        if self.denoise_model == "ddpm":
+            timesteps = torch.randint(
+                0,
+                self.position_noise_scheduler.config.num_train_timesteps,
+                (len(noise),), device=noise.device
+            ).long()
+        elif self.denoise_model == "rectified_flow":
+            timesteps = self.position_noise_scheduler.sample_noise_step(
+                num_noise=len(noise), device=noise.device
+            )
 
         # Add noise to the clean trajectories
         pos = self.position_noise_scheduler.add_noise(
@@ -393,9 +468,22 @@ class DiffuserActor(nn.Module):
         for layer_pred in pred:
             trans = layer_pred[..., :3]
             rot = layer_pred[..., 3:9]
+            # 根据模型类型选择 target
+            if self.denoise_model == "ddpm":
+                # DDPM: 预测噪声
+                target_pos = noise[..., :3]
+                target_rot = noise[..., 3:9]
+            elif self.denoise_model == "rectified_flow":
+                # RF: 预测速度场 (noise - gt)
+                target_pos = self.position_noise_scheduler.prepare_target(
+                    noise[..., :3], gt_trajectory[..., :3]
+                )
+                target_rot = self.rotation_noise_scheduler.prepare_target(
+                    noise[..., 3:9], gt_trajectory[..., 3:9]
+                )
             loss = (
-                30 * F.l1_loss(trans, noise[..., :3], reduction='mean')
-                + 10 * F.l1_loss(rot, noise[..., 3:9], reduction='mean')
+                30 * F.l1_loss(trans, target_pos, reduction='mean')
+                + 10 * F.l1_loss(rot, target_rot, reduction='mean')
             )
             if torch.numel(gt_openess) > 0:
                 openess = layer_pred[..., 9:]
@@ -549,6 +637,9 @@ class DiffusionHead(nn.Module):
             fps_feats, fps_pos,
             instr_feats
         )
+        # pos_pred torch.Size([24, 1, 3])
+        # rot_pred torch.Size([24, 1, 6])
+        # openess_pred torch.Size([24, 1, 1])
         return [torch.cat((pos_pred, rot_pred, openess_pred), -1)]
 
     def prediction_head(self,
@@ -571,6 +662,15 @@ class DiffusionHead(nn.Module):
             sampled_rel_context_pos: A tensor of shape (B, K, F, 2)
             instr_feats: (B, max_instruction_length, F)
         """
+        # gripper_pcd torch.Size([32, 1, 3])
+        # gripper_features torch.Size([1, 32, 120])
+        # context_pcd torch.Size([32, 1024, 3])
+        # context_features torch.Size([1024, 32, 120])
+        # timesteps torch.Size([32])
+        # curr_gripper_features torch.Size([3, 32, 120])
+        # sampled_context_features torch.Size([204, 32, 120])
+        # sampled_rel_context_pos torch.Size([32, 204, 120, 2])
+        # instr_feats torch.Size([32, 53, 120])
         # Diffusion timestep
         time_embs = self.encode_denoising_timestep(
             timesteps, curr_gripper_features

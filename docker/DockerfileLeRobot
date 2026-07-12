@@ -1,0 +1,106 @@
+FROM nvidia/cuda:12.6.2-devel-ubuntu20.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=Etc/UTC
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libegl1 \
+    libxext6 \
+    libxrender1 \
+    libx11-6 \
+    libxfixes3 \
+    libxi6 \
+    libxrandr2 \
+    libxinerama1 \
+    libxcursor1 \
+    libosmesa6 \
+    qt5-default \
+    xvfb \
+    unzip \
+    ffmpeg \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MINICONDA_VERSION=py310_24.9.2-0
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-${MINICONDA_VERSION}-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh
+
+ENV PATH=/opt/conda/bin:$PATH
+
+SHELL ["/bin/bash", "-c"]
+
+RUN conda config --set auto_activate_base false && \
+    conda update -y conda && \
+    conda clean -afy
+
+WORKDIR /workspace
+
+COPY lerobot_environment.yaml /tmp/lerobot_environment.yaml
+
+RUN conda env create -n lerobot -f /tmp/lerobot_environment.yaml && \
+    conda clean -afy
+
+RUN conda run -n lerobot python -c "import sys; assert sys.version_info[:2] == (3, 10)"
+
+SHELL ["conda", "run", "--no-capture-output", "-n", "lerobot", "/bin/bash", "-c"]
+
+RUN pip install --upgrade pip
+
+RUN pip install \
+    'diffusers[torch]' \
+    termcolor \
+    imageio \
+    plyfile \
+    wandb \
+    'wandb[media]' \
+    open3d \
+    h5py \
+    natsort \
+    pyquaternion \
+    num2words \
+    packaging \
+    ninja
+
+RUN pip install flash-attn==2.5.9.post1 --no-build-isolation
+
+RUN wget https://www.coppeliarobotics.com/files/V4_1_0/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz && \
+    tar -xf CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz && \
+    rm CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
+
+ENV COPPELIASIM_ROOT=/workspace/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04
+ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${COPPELIASIM_ROOT}
+ENV QT_QPA_PLATFORM_PLUGIN_PATH=${COPPELIASIM_ROOT}
+
+RUN git clone https://github.com/stepjam/PyRep.git && \
+    cd PyRep && \
+    pip install -r requirements.txt && \
+    pip install -e . && \
+    cd ..
+
+RUN git clone https://github.com/MohitShridhar/RLBench.git && \
+    cd RLBench && \
+    git checkout peract && \
+    pip install -r requirements.txt && \
+    pip install -e . && \
+    cd ..
+
+RUN git clone --depth 1 https://github.com/huggingface/lerobot.git && \
+    cd lerobot && \
+    pip install -e . && \
+    cd ..
+
+ENV TOKENIZERS_PARALLELISM=false
+
+CMD ["bash"]

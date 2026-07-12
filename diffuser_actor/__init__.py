@@ -1,2 +1,6 @@
 from .keypose_optimization.act3d import Act3D
 from .trajectory_optimization.diffuser_actor import DiffuserActor
+from .trajectory_optimization.foresight_diffuser_actor_v3 import ForesightDiffuserActorV3
+from .trajectory_optimization.foresight_diffuser_actor_v4 import ForesightDiffuserActorV4
+from .trajectory_optimization.foresight_diffuser_actor_v5 import ForesightDiffuserActorV5
+from .trajectory_optimization.foresight_diffuser_actor_v6 import ForesightDiffuserActorV6

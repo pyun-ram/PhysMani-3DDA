@@ -1,6 +1,8 @@
 """
 Precompute embeddings of instructions.
 """
+import sys
+sys.path.append("/usr/app/Code/3d_diffuser_actor")
 import re
 import json
 from pathlib import Path
@@ -100,6 +102,21 @@ def load_annotations(annotations: Tuple[Path, ...]) -> Annotations:
     return items
 
 
+def get_variations(task: str) -> List[int]:
+    if task == 'pick_moving_target_from_belt':
+        return [0]
+    else:
+        raise ValueError(f"Unknown task: {task}")
+
+def get_instruction(task: str, variation: int) -> str:
+    if task == 'pick_moving_target_from_belt':
+        if variation == 0:
+            return ['pick up the moving target from the belt and place it on the plate']
+        else:
+            raise ValueError(f"Unknown variation: {variation}")
+    else:
+        raise ValueError(f"Unknown task: {task}")
+
 if __name__ == "__main__":
     args = Arguments().parse_args()
     print(args)
@@ -112,42 +129,16 @@ if __name__ == "__main__":
     model = load_model(args.encoder)
     model = model.to(args.device)
 
-    env = RLBenchEnv(
-        data_path="",
-        apply_rgb=True,
-        apply_pc=True,
-        apply_cameras=("left_shoulder", "right_shoulder", "wrist"),
-        headless=True,
-    )
-
     instructions: Dict[str, Dict[int, torch.Tensor]] = {}
     instructions_str: Dict[str, Dict[int, str]] = {}
     tasks = set(args.tasks)
 
     for task in tqdm(tasks):
-        task_type = task_file_to_task_class(task)
-        task_inst = env.env.get_task(task_type)._task
-        task_inst.init_task()
-
         instructions[task] = {}
         instructions_str[task] = {}
-
-        variations = [v for v in args.variations if v < task_inst.variation_count()]
+        variations = get_variations(task)
         for variation in variations:
-            # check instructions among annotations
-            if task in annotations and variation in annotations[task]:
-                instr: Optional[List[str]] = annotations[task][variation]
-            # or, collect it from RLBench synthetic instructions
-            else:
-                instr = None
-                for i in range(3):
-                    try:
-                        instr = task_inst.init_episode(variation)
-                        break
-                    except:
-                        print(f"Cannot init episode {task}")
-                if instr is None:
-                    raise RuntimeError()
+            instr = get_instruction(task, variation)
 
             if args.verbose:
                 print(task, variation, instr)
@@ -176,5 +167,5 @@ if __name__ == "__main__":
     args.output.parent.mkdir(exist_ok=True)
     with open(args.output, "wb") as f:
         pickle.dump(instructions, f)
-    with open(args.output.replace('.pkl', '_str.pkl'), "wb") as f:
+    with open(str(args.output).replace('.pkl', '_str.pkl'), "wb") as f:
         pickle.dump(instructions_str, f)

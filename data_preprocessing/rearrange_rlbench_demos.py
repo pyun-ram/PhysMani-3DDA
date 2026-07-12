@@ -12,6 +12,7 @@ class Arguments(tap.Tap):
 
 def main(root_dir, task):
     variations = os.listdir(f'{root_dir}/{task}/all_variations/episodes')
+    variations = sorted(variations, key=lambda x: int(Path(x).stem.replace('episode', '')))
     seen_variations = {}
     for variation in variations:
         num = int(variation.replace('episode', ''))

@@ -9,7 +9,7 @@ import torch.optim as optim
 from matplotlib import pyplot as plt
 import numpy as np
 
-from datasets.dataset_calvin import CalvinDataset
+from datasets_module.dataset_calvin import CalvinDataset
 from main_trajectory import TrainTester as BaseTrainTester
 from main_trajectory import traj_collate_fn, fig_to_numpy, Arguments
 from utils.common_utils import (

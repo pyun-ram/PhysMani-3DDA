@@ -15,6 +15,35 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 
 
+from collections import OrderedDict
+
+# 定义一个有最大容量限制的字典
+class LRUCache(OrderedDict):
+    def __init__(self, maxsize=128, *args, **kwargs):
+        self.maxsize = maxsize
+        super().__init__(*args, **kwargs)
+
+    def __getitem__(self, key):
+        """访问一个键时，将其移到字典末尾，表示最近使用过。"""
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value):
+        """
+        设置一个键时，如果缓存超限，则移除最旧的键，并关闭对应的文件句柄。
+        """
+        super().__setitem__(key, value)
+        if len(self) > self.maxsize:
+            # 获取最旧的键
+            oldest_key = next(iter(self))
+            # 获取对应的句柄，并关闭它
+            oldest_handle = self[oldest_key]
+            if hasattr(oldest_handle, 'close'):
+                oldest_handle.close()
+            # 最后，从字典中删除最旧的键
+            del self[oldest_key]
+
 class BaseTrainTester:
     """Basic train/test class to be inherited."""
 
@@ -42,6 +71,15 @@ class BaseTrainTester:
             np.random.seed(worker_seed)
             random.seed(worker_seed)
             np.random.seed(np.random.get_state()[1][0] + worker_id)
+        def h5_worker_init_fn(worker_id):
+            seed_worker(worker_id)
+            worker_info = torch.utils.data.get_worker_info()
+            dataset = worker_info.dataset
+            # [Note]: Use cache size 1 to avoid memory explosion in testing
+            dataset._h5_cache = LRUCache(
+                maxsize=1,
+            )
+            return
         # Datasets
         train_dataset, test_dataset = self.get_datasets()
         # Samplers and loaders
@@ -53,20 +91,20 @@ class BaseTrainTester:
             batch_size=self.args.batch_size,
             shuffle=False,
             num_workers=self.args.num_workers,
-            worker_init_fn=seed_worker,
+            worker_init_fn=h5_worker_init_fn,
             collate_fn=collate_fn,
             pin_memory=True,
             sampler=train_sampler,
             drop_last=True,
             generator=g
         )
-        test_sampler = DistributedSampler(test_dataset, shuffle=True)
+        test_sampler = DistributedSampler(test_dataset, shuffle=not self.args.eval_only)
         test_loader = DataLoader(
             test_dataset,
             batch_size=self.args.batch_size_val,
             shuffle=False,
-            num_workers=0,
-            worker_init_fn=seed_worker,
+            num_workers=1,
+            worker_init_fn=h5_worker_init_fn,
             collate_fn=collate_fn,
             pin_memory=True,
             sampler=test_sampler,
@@ -135,10 +173,7 @@ class BaseTrainTester:
             model.eval()
             new_loss = self.evaluate_nsteps(
                 model, criterion, test_loader, step_id=-1,
-                val_iters=max(
-                    5,
-                    int(4 * len(self.args.tasks)/self.args.batch_size_val)
-                )
+                val_iters=-1
             )
             return model
 
@@ -159,8 +194,8 @@ class BaseTrainTester:
                 new_loss = self.evaluate_nsteps(
                     model, criterion, train_loader, step_id,
                     val_iters=max(
-                        5,
-                        int(4 * len(self.args.tasks)/self.args.batch_size_val)
+                        10,
+                        int(50 * len(self.args.tasks)/self.args.batch_size_val)
                     ),
                     split='train'
                 )
@@ -169,9 +204,10 @@ class BaseTrainTester:
                 new_loss = self.evaluate_nsteps(
                     model, criterion, test_loader, step_id,
                     val_iters=max(
-                        5,
-                        int(4 * len(self.args.tasks)/self.args.batch_size_val)
-                    )
+                        10,
+                        int(50 * len(self.args.tasks)/self.args.batch_size_val)
+                    ),
+                    split='val'
                 )
                 if dist.get_rank() == 0:  # save model
                     best_loss = self.save_checkpoint(

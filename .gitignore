@@ -28,3 +28,8 @@ calvin/
 
 # data directory
 data/
+unit_tests/
+debug*/
+vis_*/
+build/
+*.so

@@ -1,4 +1,3 @@
-import dgl.geometry as dgl_geo
 import einops
 import torch
 from torch import nn
@@ -9,7 +8,7 @@ from .position_encodings import RotaryPositionEncoding3D
 from .layers import FFWRelativeCrossAttentionModule, ParallelAttention
 from .resnet import load_resnet50, load_resnet18
 from .clip import load_clip
-
+from submodules.fps import farthest_point_sampling_with_mask
 
 class Encoder(nn.Module):
 
@@ -160,7 +159,7 @@ class Encoder(nn.Module):
 
         return gripper_feats, gripper_pos
 
-    def encode_images(self, rgb, pcd):
+    def encode_images(self, rgb, pcd, mask=None):
         """
         Compute visual features/pos embeddings at different scales.
 
@@ -184,9 +183,12 @@ class Encoder(nn.Module):
 
         # Treat different cameras separately
         pcd = einops.rearrange(pcd, "bt ncam c h w -> (bt ncam) c h w")
+        if mask is not None:
+            mask = einops.rearrange(mask, "bt ncam c h w -> (bt ncam) c h w")
 
         rgb_feats_pyramid = []
         pcd_pyramid = []
+        mask_pyramid = []
         for i in range(self.num_sampling_level):
             # Isolate level's visual features
             rgb_features_i = rgb_features[self.feature_map_pyramid[i]]
@@ -212,8 +214,22 @@ class Encoder(nn.Module):
 
             rgb_feats_pyramid.append(rgb_features_i)
             pcd_pyramid.append(pcd_i)
+            if mask is not None:
+                mask_i = F.interpolate(
+                    mask,
+                    (feat_h, feat_w),
+                    mode='bilinear'
+                )
+                mask_i = einops.rearrange(
+                    mask_i,
+                    "(bt ncam) c h w -> bt (ncam h w) c", ncam=num_cameras
+                )
+                mask_pyramid.append(mask_i)
+            else:
+                mask_i = torch.ones_like(pcd_i)[..., 0]
+                mask_pyramid.append(mask_i)
 
-        return rgb_feats_pyramid, pcd_pyramid
+        return rgb_feats_pyramid, pcd_pyramid, mask_pyramid
 
     def encode_instruction(self, instruction):
         """
@@ -235,21 +251,19 @@ class Encoder(nn.Module):
         instr_dummy_pos = self.relative_pe_layer(instr_dummy_pos)
         return instr_feats, instr_dummy_pos
 
-    def run_fps(self, context_features, context_pos):
+    def run_fps(self, context_features, context_pos, context_pos_xyz, context_mask):
         # context_features (Np, B, F)
         # context_pos (B, Np, F, 2)
         # outputs of analogous shape, with smaller Np
         npts, bs, ch = context_features.shape
-
-        # Sample points with FPS
-        sampled_inds = dgl_geo.farthest_point_sampler(
+        sampled_inds = farthest_point_sampling_with_mask(
             einops.rearrange(
                 context_features,
                 "npts b c -> b npts c"
             ).to(torch.float64),
-            max(npts // self.fps_subsampling_factor, 1), 0
+            max(npts // self.fps_subsampling_factor, 1),
+            context_mask.squeeze(-1), start_idx=None,
         ).long()
-
         # Sample features
         expanded_sampled_inds = sampled_inds.unsqueeze(-1).expand(-1, -1, ch)
         sampled_context_features = torch.gather(
@@ -266,7 +280,14 @@ class Encoder(nn.Module):
         sampled_context_pos = torch.gather(
             context_pos, 1, expanded_sampled_inds
         )
-        return sampled_context_features, sampled_context_pos
+        _, _, ch = context_pos_xyz.shape
+        expanded_sampled_inds = (
+            sampled_inds.unsqueeze(-1).expand(-1, -1, ch)
+        )
+        sampled_context_pos_xyz = torch.gather(
+            context_pos_xyz, 1, expanded_sampled_inds
+        )
+        return sampled_context_features, sampled_context_pos, sampled_context_pos_xyz
 
     def vision_language_attention(self, feats, instr_feats):
         feats, _ = self.vl_attention[0](
