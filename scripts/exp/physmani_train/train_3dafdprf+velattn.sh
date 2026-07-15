@@ -1,3 +1,8 @@
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../" && pwd)"
+THIRD_PARTY_DIR="$(cd "${PROJECT_ROOT}/.." && pwd)"
+export PYTHONPATH="${PROJECT_ROOT}:${THIRD_PARTY_DIR}/RLBench:${THIRD_PARTY_DIR}/PyRep:${PYTHONPATH:-}"
+
 main_dir=physmani
 
 dataset=data/rmt/physmani_bench/train_package_compressed/
